@@ -4,6 +4,7 @@ import datetime
 import sys
 from string import Template
 from pathlib import Path
+import requests
 
 ### ----------------------------------------------------------------------------------------------------
 ### System Settings      -
@@ -35,6 +36,20 @@ sage_session_id = "sage"+str(timestamp) # subject to change --> may need to save
 sage_RAG_id = "sage_rag2"#+str(timestamp)
 sage_rag_t = 0.4 # subject to change
 sage_rag_k = 5 # top number of chunks to fetch to use for rag, lets see if we need to set this
+
+### ----------------------------------------------------------------------------------------------------
+### Sage Settings        -
+### ----------------------------------------------------------------------------------------------------
+
+ivy = LLMProxy()
+ivy_model = 'gemini-2.5-flash-lite'
+# ivy_html_system = f"""You will receive the raw HTML of a webpage. Extract the key findings, important topics, and any key dates. Respond briefly and clearly."""
+ivy_html_system = f"""You will receive the raw HTML of a webpage and user input in the format HTML:<HTML> UserInput:<usr>. Extract the key findings from the webpage that is related to the user input. Respond briefly and clearly."""
+# ivy_discern_system = f"""You will receive a question, first answer with either 'Yes' or 'No'. Then respond with a reason in the format: Why: <reason>."""
+ivy_discern_system = f"""respond in the format <Yes or No>|<reason why>"""
+ivy_session_id = "ivy"+str(timestamp)
+ivy_temperature = 0.2 # subject to change
+
 
 ### ----------------------------------------------------------------------------------------------------
 ### Helpers        -
@@ -306,6 +321,110 @@ def chat_with_sage(user_message):
         "rag_context": rag_context
     }
 
+def search_web(file, usr):
+    # I propose our web crawler be named Ivy! This is a crawling and climbing vine that (unfortunately) can spread
+    # fires, especially in california
+
+    #1. determine if this request needs a websearch to local news
+    # TODO: try the question: Does the info from the user need information from local news services to be satisfied
+    # TODO: try, is the information the user gave in relation to current events / imply a relation to current events?
+    #              If yes then search local news services
+    # discern_query = f"""This is a query sent in by a user: {usr}\nwould answering the above query benefit from information from local news coverage?"""
+    # discern_query = f"""This is info sent in by a user: {usr}\nis the information above in relation to current events?"""
+    
+    # discern_query = f"""The user said this: {usr}\nwould an response to the above benefit from information from local news coverage?"""
+
+    # resp = prompt_ivy(discern_query, ivy_discern_system)
+    # log_ivy(file, resp)
+    # response_parts = extract_response_string(resp).split("|")
+    # if len(response_parts) != 2:
+    #     # Something has gone wrong with formatting, dont conduct internet search
+    #     return
+    # elif response_parts[0] != "Yes":
+    #     print("No internet search was deemed necessary")
+    #     return
+
+    #1.5, ask Sage what area is important to look for info in?
+    # Idea: if sage does not know the relevant area, pause this process and have Sage ask the user follow up questions
+    #           then report this info to 
+
+    # 1. Fetch relevant webpages
+    url = "https://thesunreporter.com/"
+    page = requests.get(url)
+    html_text = page.text
+    # print(html_text)
+
+    # compile_url_prompt = "return all the URLs that relate to news articles in this format: [<url>, <url>, ... <url>]"
+
+    # Idea: attach a timestamp to the stored html pages and if its older than X hours, re-fetch
+
+    # # Systematically go through each webpage
+    # combo_prompt = f"""HTML:{html_text} UserInput:{usr} """
+    # resp = prompt_ivy(combo_prompt, ivy_html_system)
+    # log_ivy(file, resp)
+    site_crawl(1, file, url, usr)
+
+    # IDEA: hve a depth map so that we dont have to re-compile the links every time we come in
+
+def site_crawl(depth, file, url, usr, retry=2):
+    page = requests.get(url)
+    html_text = page.text
+    local_retry = retry
+    print("html text len: ", len(html_text))
+
+    if depth != 0:
+        valid = False
+        while local_retry > 0:
+            compile_url_prompt = "return all the URLs that relate to news articles in this format: [<url>, <url>, ... <url>]"
+            combo_prompt = f"""HTML:{html_text} UserInput:{compile_url_prompt} """
+            resp = prompt_ivy(combo_prompt, ivy_html_system)
+            resp_str = extract_response_string(resp).strip()
+            if len(resp_str) == 0:
+                local_retry -= 1
+                print("Whomp!!")
+                continue
+            log_ivy(file, resp)
+            print(f"""resp_str[0]: {resp_str[0]}, resp_str[-1]: {resp_str[-1]}""")
+            if resp_str[0] == "[" and resp_str[-1] == "]":
+                #we have a proper array returned
+                # While it may be more efficient ot put it directly in list format with no braces having the 
+                # bracketed form makes it easier for the LLM to relate to a structure and gives us an easy thing
+                # to check for propoer formation
+                print("URL EXTRACTION from: ", url)
+                valid = True
+                break
+            else:
+                print("UGHHHHHHH!!!!!!!!!!!")
+            local_retry -= 1
+        if not valid:
+            #TODO: determine if something specific needs to be retruned in case of failure
+            return
+        url_list = resp_str[1:-1].split(",")
+        for u in url_list:
+            # each url is encased with brackets so we have to strip those off as well...
+            print("Investigating URL: ", u, " after splitting: ", u.split('"'))
+            site_crawl(depth - 1, file,  u.split('"')[1], usr, retry)
+
+    search_prompt = f"""HTML:{html_text} UserInput:{usr} """
+    resp = prompt_ivy(search_prompt, ivy_html_system)
+    print(f"""URL: {url}""")
+    log_ivy(file, resp)
+
+#what is happening to this community's students    
+
+def prompt_ivy(query_prompt, ivy_sys):
+
+    response = sage.generate(
+        model = ivy_model,
+        system = ivy_sys,
+        query = query_prompt,
+        temperature = ivy_temperature,
+        session_id = ivy_session_id,
+    )
+
+    return response
+
+
 ### ----------------------------------------------------------------------------------------------------
 ### Logging Functions, Assess Question         -
 ### ----------------------------------------------------------------------------------------------------
@@ -318,14 +437,7 @@ def log_user(file, text, verbose=verbose):
         print(phrase)
 
 def log_sage(file, response, rag_context, verbose=verbose, display_rag=display_rag):
-    phrase = ""
-    
-    if isinstance(response, dict):
-        phrase = f"""Sage: {response.get("result")}\n"""
-    elif isinstance(response, tuple):
-        phrase = f"""Sage: {response[0]["result"]}\n"""
-    else:
-        phrase = f"""Sage: {response}\n"""
+    phrase = f"""Sage: {extract_response_string(response)}\n"""
     
     file.write(phrase)
     
@@ -336,27 +448,36 @@ def log_sage(file, response, rag_context, verbose=verbose, display_rag=display_r
     elif(display_rag == 2):
         print(f"""\n******************\nRag_context_length: {len(rag_context)} \n******************\n\n""")
 
+def log_ivy(file, response, verbose=verbose):
+    phrase = f"""Ivy: {extract_response_string(response)}\n"""    
+    # file.write(phrase)
 
-def assess_question_type(file, text):
-    assess_prompt = f"""The user has asked this: {text}\n\n Based on question-types.pdf, what category does this question fall into? 
-    If it is not a question say its category is Non-Question. Give your reasoning for your choice. The final answer should follow a newline character."""
-    resp = prompt_sage(assess_prompt)
-    log_sage(file, resp, verbose)
+    if(verbose):
+        print(phrase)
 
+def extract_response_string(response):
+    if isinstance(response, dict):
+        res = response.get("result")
+    elif isinstance(response, tuple):
+        res = response[0]["result"]
+    else:
+        res = response
+    
+    return res
 
 ### ----------------------------------------------------------------------------------------------------
 # Command Line Interface
 ### ----------------------------------------------------------------------------------------------------
 
 def run_cli():
-    if not setup_sage():
-        print("An error occurred when setting up this application.")
-        sys.exit(1)
+    # if not setup_sage():
+    #     print("An error occurred when setting up this application.")
+    #     sys.exit(1)
 
     with open(f"log-{timestamp}.txt", "w", encoding="utf-8") as file:
         # Intro
-        intro = get_intro()
-        log_sage(file, intro, "")
+        # intro = get_intro()
+        # log_sage(file, intro, "")
 
         usr = input("Type your response here: ")
 
@@ -364,18 +485,20 @@ def run_cli():
             # Log user input
             log_user(file, usr)
 
+            search_web(file, usr)
+
             # Core chat call
-            result = chat_with_sage(usr)
+            # result = chat_with_sage(usr)
 
-            # Log and print answer
-            log_sage(file, result["answer"], result["rag_context"])
+            # # Log and print answer
+            # log_sage(file, result["answer"], result["rag_context"])
 
-            # Show sources if they exist
-            if result["sources"]:
-                print("\nCitation Summary:\n")
-                log_sage(file, result["sources"], "")
-            else:
-                print("WARNING: No vetted resources were used to produce the information above")
+            # # Show sources if they exist
+            # if result["sources"]:
+            #     print("\nCitation Summary:\n")
+            #     log_sage(file, result["sources"], "")
+            # else:
+            #     print("WARNING: No vetted resources were used to produce the information above")
 
             # Next input
             usr = input("Type your response here: ")
@@ -383,3 +506,11 @@ def run_cli():
 
 if __name__ == '__main__':
     run_cli()
+
+# sample statements
+#
+# how would i organize a local group involving wildfires? 
+# I want to organize a neighborhood group focused on wildfire recovery actions, I have not contacted any local authorities.
+# the purpose is to invite teh neigbors to a meeting, they are adults and community members, I want a standard format which i can subsititute roles n placeholders
+#
+#

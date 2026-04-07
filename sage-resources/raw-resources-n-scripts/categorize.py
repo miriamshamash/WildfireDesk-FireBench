@@ -1,3 +1,6 @@
+###
+### This script is use to turn the HTML data of the Healthy Democracy webpage into easily parseable JSONL files
+###
 import re
 from collections import defaultdict
 import os
