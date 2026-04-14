@@ -5,18 +5,28 @@ import sys
 from string import Template
 from pathlib import Path
 import requests
+import json
+from operator import itemgetter
+import ast
 
 ### ----------------------------------------------------------------------------------------------------
 ### System Settings      -
 ### ----------------------------------------------------------------------------------------------------
 
-timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+timestamp_format = "%Y-%m-%d_%H-%M-%S"
+timestamp = datetime.datetime.now().strftime(timestamp_format)
+timestamp_stale_allowance = 1
+crawl_depth = 1
+SUMMARIZE = 0
+SEARCH = 1
 verbose = True
 display_rag = 0
 chatbot_democracy_resources_directory = "sage-resources/democracy-chatbot-resources"
 chatbot_wildfire_resources_directory = "sage-resources/wildfire-resources"
 sage_instructions_directory = "sage-resources/sage-instructions"
 upload_resources = False
+crawl_time = ""
+news_resources = "sage-resources/web-crawl-data"
 
 ### ----------------------------------------------------------------------------------------------------
 ### Sage Settings        -
@@ -355,18 +365,110 @@ def search_web(file, usr):
     # print(html_text)
 
     # compile_url_prompt = "return all the URLs that relate to news articles in this format: [<url>, <url>, ... <url>]"
-
     # Idea: attach a timestamp to the stored html pages and if its older than X hours, re-fetch
 
     # # Systematically go through each webpage
     # combo_prompt = f"""HTML:{html_text} UserInput:{usr} """
     # resp = prompt_ivy(combo_prompt, ivy_html_system)
     # log_ivy(file, resp)
-    site_crawl(1, file, url, usr)
+
+    # {"Timestamp": "", "Depth": 0, "URL": "", "Summary": ""}
+    root_name = "San_Francisco_Sun_Reporter"
+    root = get_root(root_name)
+    print("Root: ", root)
+    global crawl_time
+    crawl_time = datetime.datetime.now().strftime(timestamp_format)
+    records = []
+    if redo_crawl_check(root, crawl_time):
+        # records = []
+        site_crawl(crawl_depth, file, url, usr, records, SUMMARIZE)
+        
+        print("Final records length: ", len(records))
+        print(f""" Records: {records}""")
+        # records = sorted(records, key=itemgetter("Depth"), reverse="True")
+
+        # save the records in the crawl file
+        # Note below completely cleans the file any time its opened like this, if we want to keep
+        # record we will need to implement extra logic
+        crawl_file = open(f"""{news_resources}/{root_name}.jsonl""", "w")
+        for r in records:
+            crawl_file.write(json.dumps(r) + "\n")
+        crawl_file.close()
+
+        # make the summaries list and prompt around that
+    else:
+        records = get_all_crawl_data(root_name)
+    sum = get_summaries_list(root_name)
+    if sum == "":
+        print("Something went wrong with making the summary")
+        return
+    eval_summaries_prompt = f"""Here is a numbered list of a summary of resources:\n{sum}
+    For each summary determine whether it is True or False that a webpage with that content would be beneficial to providing a response to this user input: {usr}.
+    Respond in this format: {{<number>:<True or False>, <number>:<True or False>, ..., <number>:<True or False>}}"""
+
+    print(eval_summaries_prompt)
+
+    retry = 2
+    valid = False
+    record_ledger = {}
+    while retry > 0:
+        resp = prompt_ivy(eval_summaries_prompt, ivy_html_system)
+        log_ivy(None, resp)
+        resp_str = extract_response_string(resp)
+        try:
+            record_ledger = ast.literal_eval(resp_str)
+        except:
+            retry -= 1
+            continue
+        valid = True
+        break
+    
+    if not valid:
+        # TODO: here is where we shoudl return something specific
+        print("There was a problem getting the ledger")
+        return
+
+    # THis will aggregate the information based on what the usr asked and the content
+    web_info = []
+    res = []
+    for i in range(len(records)):
+        try:
+            if record_ledger[i + 1]:
+                print("Exploring record: ", i+1)
+                target = records[i]
+                site_crawl(0, file, target["URL"], usr, web_info, SEARCH)
+                web_record = {
+                    "Outlet": root_name, # TODO: replace this with the non-underscored version
+                    "URL": target["URL"],
+                    "Info": web_info[-1]
+                }
+                res.append(web_record)
+        except:
+            # the enumeration would fall here because the website had no information of note and thus never got an entry
+            continue
+
+    print("USER RELATED RESPONSE")
+    for i in range(len(res)):
+        print(f"""************ Response {i} ************""")
+        # print(f"""{web_info[i]["Summary"]} """)
+        print(res[i])
+        print("************************\n")
+
+    return res
+    # records = []
+    # site_crawl(1, file, url, usr, records)
 
     # IDEA: hve a depth map so that we dont have to re-compile the links every time we come in
 
-def site_crawl(depth, file, url, usr, retry=2):
+# IDEA: feed the LLM a list of summaries then have it respons in a dictionary format {1: T/F, 2: T/F, .... X: T/F}
+#       Then go through and scrape the ones the model responded true for.
+
+# IDEA: have a toggle that evaluates the relation to the user query one time so we dont have to re-query later in web_search()
+# There are two modes, summarize and search:
+#               * summarize gets the summary of the webpage
+#               * search pulls information related to the usr statement
+def site_crawl(depth, file, url, usr, results, mode, retry=2):
+    # TODO: set up protections around here in case url is faulty
     page = requests.get(url)
     html_text = page.text
     local_retry = retry
@@ -375,7 +477,7 @@ def site_crawl(depth, file, url, usr, retry=2):
     if depth != 0:
         valid = False
         while local_retry > 0:
-            compile_url_prompt = "return all the URLs that relate to news articles in this format: [<url>, <url>, ... <url>]"
+            compile_url_prompt = "return all the URLs that relate to news articles in this format only: [<url>, <url>, ... <url>]. For example: [\"https://foo\", \"https://bar\"]"
             combo_prompt = f"""HTML:{html_text} UserInput:{compile_url_prompt} """
             resp = prompt_ivy(combo_prompt, ivy_html_system)
             resp_str = extract_response_string(resp).strip()
@@ -399,16 +501,120 @@ def site_crawl(depth, file, url, usr, retry=2):
         if not valid:
             #TODO: determine if something specific needs to be retruned in case of failure
             return
+
         url_list = resp_str[1:-1].split(",")
         for u in url_list:
             # each url is encased with brackets so we have to strip those off as well...
-            print("Investigating URL: ", u, " after splitting: ", u.split('"'))
-            site_crawl(depth - 1, file,  u.split('"')[1], usr, retry)
+            clean_url = u.split('"')[1]
+            print("Investigating URL: ", clean_url)
+            site_crawl(depth - 1, file, clean_url, usr, results, mode, retry)
 
-    search_prompt = f"""HTML:{html_text} UserInput:{usr} """
-    resp = prompt_ivy(search_prompt, ivy_html_system)
+    # check if there is an existing record
+    if mode == SUMMARIZE:
+        ivy_prompt = f"""HTML:{html_text} UserInput: Summarize the content of this webpage in 4 sentences. Mention the main topic, key words and any social groups of people it mentions."""
+    else:
+        ivy_prompt = f"""HTML:{html_text} UserInput:{usr}\nIf there is no relevant information to the UserInput reply only with the word None. """
+
+    resp = prompt_ivy(ivy_prompt, ivy_html_system)
+
     print(f"""URL: {url}""")
     log_ivy(file, resp)
+
+    record = {
+        "Timestamp": crawl_time,
+        "Depth": depth,
+        "URL": url,
+        "Summary": extract_response_string(resp)
+    }
+    results.append(record)
+    print("Results length: ", len(results))
+
+# This function will tell us if we shole re-scrape the website if the 
+def redo_crawl_check(record, current_time_str):
+    if record == None:
+        return True
+    record_time = datetime.datetime.strptime(record["Timestamp"], timestamp_format)
+    current_time = datetime.datetime.strptime(current_time_str, timestamp_format)
+    diff = current_time - record_time
+    return diff.days >= timestamp_stale_allowance
+
+def check_start_end(str, start_char, end_char):
+    pass
+
+def get_root(root_name):
+    # This is funciton works two fold, it checks if the crawl file exists and it returns the record for the root of the file (homepage of the site)
+    # The timestamp of all records should be the same so we just need to check that it is within the time allowed for stale data
+    # IDEA: Articles are unlikely to change, but the homepage would feature new articles daily, we could keep old ones as a record and reference them later...
+    try:
+        name = f"""{news_resources}/{root_name}.jsonl"""
+        print("getting root of nanma: ", name)
+        crawl_file = open(f"""{news_resources}/{root_name}.jsonl""")
+        root = json.loads(crawl_file.readline())
+        print("get root root: ", root)
+        crawl_file.close()
+        return root
+    except:
+        # the record dosent exist, exit
+        print("Failed get root open")
+        return None
+
+def get_crawl_record(url, root_name):
+    # if a record is present returns that record if not returns None
+    try:
+        crawl_file = open(f"""{news_resources}/{root_name}.jsonl""")
+
+        line = crawl_file.readline()
+        # when line is none then that is the end of the file
+        while line:
+            record = json.loads(line)
+            if record["URL"] == url:
+                return record
+            line = crawl_file.readline()
+        crawl_file.close()
+    except:
+        # the record dosent exist, exit
+        return None
+    return None
+
+def get_all_crawl_data(root_name):
+    res = []
+    try:
+        crawl_file = open(f"""{news_resources}/{root_name}.jsonl""")
+        line = crawl_file.readline()
+
+        while line:
+            record = json.loads(line)
+            res.append(record)
+            line = crawl_file.readline()
+        crawl_file.close()
+    except:
+        return res
+    return res
+
+def get_summaries_list(root_name):
+    sum = ""
+    idx = 1
+    try:
+        crawl_file = open(f"""{news_resources}/{root_name}.jsonl""")
+
+        line = crawl_file.readline()
+        # when line is none then that is the end of the file
+        while line:
+            record = json.loads(line)
+            sum = sum + f"""{idx}. {record["Summary"]}\n"""
+            line = crawl_file.readline()
+            idx += 1
+        crawl_file.close()
+    except:
+        # the record dosent exist, exit
+        return sum
+    return sum
+
+def ref_data_storage():
+    pass
+
+def store_crawl():
+    pass
 
 #what is happening to this community's students    
 
@@ -479,6 +685,7 @@ def run_cli():
         # intro = get_intro()
         # log_sage(file, intro, "")
 
+        print(str(timestamp))
         usr = input("Type your response here: ")
 
         while usr != "quit":
