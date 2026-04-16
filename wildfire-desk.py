@@ -8,6 +8,8 @@ import requests
 import json
 from operator import itemgetter
 import ast
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
 ### ----------------------------------------------------------------------------------------------------
 ### System Settings      -
@@ -57,6 +59,7 @@ ivy_model = 'gemini-2.5-flash-lite'
 ivy_html_system = f"""You will receive the raw HTML of a webpage and user input in the format HTML:<HTML> UserInput:<usr>. Extract the key findings from the webpage that is related to the user input. Respond briefly and clearly."""
 # ivy_discern_system = f"""You will receive a question, first answer with either 'Yes' or 'No'. Then respond with a reason in the format: Why: <reason>."""
 ivy_discern_system = f"""respond in the format <Yes or No>|<reason why>"""
+ivy_url_disection = f"""You will recieve a list of links from a webpage and a user input in the format URLs:<URL list> UserInput:<usr>. Return all urls that would lead to a news article in the format: [<url>, <url>, ... <url>]. For example: [\"https://foo\", \"https://bar\"]. If there are no urls present respond with: []"""
 ivy_session_id = "ivy"+str(timestamp)
 ivy_temperature = 0.2 # subject to change
 
@@ -359,10 +362,19 @@ def search_web(file, usr):
     #           then report this info to 
 
     # 1. Fetch relevant webpages
-    url = "https://thesunreporter.com/"
-    page = requests.get(url)
-    html_text = page.text
+    # url = "https://outlooknewspapers.com/pasadenaoutlook/"
     # print(html_text)
+
+    # print(f"""{url}: {len(requests.get(url).text)} """)
+
+    # url = "https://thesunreporter.com/"
+
+    # print(f"""{url}: {len(requests.get(url).text)} """)
+
+    url = "https://www.berkeleyside.org/"
+
+    # print(f"""{url}: {len(requests.get(url).text)} """)
+
 
     # compile_url_prompt = "return all the URLs that relate to news articles in this format: [<url>, <url>, ... <url>]"
     # Idea: attach a timestamp to the stored html pages and if its older than X hours, re-fetch
@@ -373,7 +385,9 @@ def search_web(file, usr):
     # log_ivy(file, resp)
 
     # {"Timestamp": "", "Depth": 0, "URL": "", "Summary": ""}
-    root_name = "San_Francisco_Sun_Reporter"
+    # root_name = "San_Francisco_Sun_Reporter"
+    # root_name = "Berkeleyside"
+    root_name = "berkeleytest"
     root = get_root(root_name)
     print("Root: ", root)
     global crawl_time
@@ -381,7 +395,7 @@ def search_web(file, usr):
     records = []
     if redo_crawl_check(root, crawl_time):
         # records = []
-        site_crawl(crawl_depth, file, url, usr, records, SUMMARIZE)
+        site_crawl2(crawl_depth, file, url, usr, records, SUMMARIZE)
         
         print("Final records length: ", len(records))
         print(f""" Records: {records}""")
@@ -436,7 +450,7 @@ def search_web(file, usr):
             if record_ledger[i + 1]:
                 print("Exploring record: ", i+1)
                 target = records[i]
-                site_crawl(0, file, target["URL"], usr, web_info, SEARCH)
+                site_crawl2(0, file, target["URL"], usr, web_info, SEARCH)
                 web_record = {
                     "Outlet": root_name, # TODO: replace this with the non-underscored version
                     "URL": target["URL"],
@@ -470,50 +484,69 @@ def search_web(file, usr):
 def site_crawl(depth, file, url, usr, results, mode, retry=2):
     # TODO: set up protections around here in case url is faulty
     page = requests.get(url)
-    html_text = page.text
-    local_retry = retry
-    print("html text len: ", len(html_text))
+    html_content = extract_html_content(page.text)
+    # html_links = extract_html_links(page.text, url)
+    # print(html_links)
+    # print("html text len: ", len(html_content))
+    # print(html_content)
 
     if depth != 0:
+        html_chunks = html_chunk(page.text)
         valid = False
-        while local_retry > 0:
-            compile_url_prompt = "return all the URLs that relate to news articles in this format only: [<url>, <url>, ... <url>]. For example: [\"https://foo\", \"https://bar\"]"
-            combo_prompt = f"""HTML:{html_text} UserInput:{compile_url_prompt} """
-            resp = prompt_ivy(combo_prompt, ivy_html_system)
-            resp_str = extract_response_string(resp).strip()
-            if len(resp_str) == 0:
+        url_list = []
+        for chunk in html_chunks:
+            local_retry = retry 
+            while local_retry > 0:
+                # perhaps try webpage chunking as a solution......
+                compile_url_prompt = f"""return all the URLs that start with http and relate to news articles from {url} in this format only: [<url>, <url>, ... <url>]. For example: [\"https://foo\", \"https://bar\"]. If there are no urls present respond with: []"""
+                combo_prompt = f"""HTML:{chunk} UserInput:{compile_url_prompt} """
+                # print("COMBO PROMPT: ", combo_prompt, "\n\n")
+                resp = prompt_ivy(combo_prompt, ivy_html_system)
+                resp_str = extract_response_string(resp).strip()
+                if len(resp_str) == 0:
+                    local_retry -= 1
+                    print("Whomp!!")
+                    continue
+                log_ivy(file, resp)
+                print("chunk length: ", len(chunk))
+                print(f"""resp_str[0]: {resp_str[0]}, resp_str[-1]: {resp_str[-1]}""")
+                if resp_str[0] == "[" and resp_str[-1] == "]":
+                    #we have a proper array returned
+                    # While it may be more efficient ot put it directly in list format with no braces having the 
+                    # bracketed form makes it easier for the LLM to relate to a structure and gives us an easy thing
+                    # to check for propoer formation
+                    print("URL EXTRACTION from: ", url)
+                    valid = True
+                    break
+                else:
+                    print("UGHHHHHHH!!!!!!!!!!!")
                 local_retry -= 1
-                print("Whomp!!")
-                continue
-            log_ivy(file, resp)
-            print(f"""resp_str[0]: {resp_str[0]}, resp_str[-1]: {resp_str[-1]}""")
-            if resp_str[0] == "[" and resp_str[-1] == "]":
-                #we have a proper array returned
-                # While it may be more efficient ot put it directly in list format with no braces having the 
-                # bracketed form makes it easier for the LLM to relate to a structure and gives us an easy thing
-                # to check for propoer formation
-                print("URL EXTRACTION from: ", url)
-                valid = True
+            if local_retry == 0:
+                #TODO: determine if something specific needs to be retruned in case of failure
+                # Perhaps we just explore what we found....
                 break
-            else:
-                print("UGHHHHHHH!!!!!!!!!!!")
-            local_retry -= 1
-        if not valid:
-            #TODO: determine if something specific needs to be retruned in case of failure
-            return
-
-        url_list = resp_str[1:-1].split(",")
+            url_list.extend(resp_str[1:-1].split(","))
+        
+        # recursively explore all the collected urls
         for u in url_list:
             # each url is encased with brackets so we have to strip those off as well...
-            clean_url = u.split('"')[1]
+            url_components = u.split('"')
+            clean_url = ""
+            print("u: ", u, "u compenents: ", url_components)
+            for uc in url_components:
+                if "http" in uc:
+                    clean_url = uc
+                    break
+            if clean_url == "":
+                continue
             print("Investigating URL: ", clean_url)
             site_crawl(depth - 1, file, clean_url, usr, results, mode, retry)
 
     # check if there is an existing record
     if mode == SUMMARIZE:
-        ivy_prompt = f"""HTML:{html_text} UserInput: Summarize the content of this webpage in 4 sentences. Mention the main topic, key words and any social groups of people it mentions."""
+        ivy_prompt = f"""HTML:{html_content} UserInput: Summarize the content of this webpage in 4 sentences. Mention the main topic, key words and any social groups of people it mentions."""
     else:
-        ivy_prompt = f"""HTML:{html_text} UserInput:{usr}\nIf there is no relevant information to the UserInput reply only with the word None. """
+        ivy_prompt = f"""HTML:{html_content} UserInput:{usr}\nIf there is no relevant information to the UserInput reply only with the word None. """
 
     resp = prompt_ivy(ivy_prompt, ivy_html_system)
 
@@ -529,6 +562,101 @@ def site_crawl(depth, file, url, usr, results, mode, retry=2):
     results.append(record)
     print("Results length: ", len(results))
 
+def site_crawl2(depth, file, url, usr, results, mode, retry=2):
+    page = requests.get(url)
+    html_content = extract_html_content(page.text)
+    html_links = extract_html_links(page.text, url)
+    html_links, links = get_urls_list(html_links)
+    print(html_links)
+    print("html text len: ", len(html_content))
+
+    if depth != 0:
+        html_chunks = html_chunk(page.text)
+        valid = False
+        local_retry = retry 
+        while local_retry > 0:
+            # compile_url_prompt = f"""return all the URLs that relate to news articles from {url} in this format only: [<url>, <url>, ... <url>]. For example: [\"https://foo\", \"https://bar\"]. If there are no urls present respond with: []"""
+            compile_url_prompt = f"""Here is a numbered list of urls found on a news webpage:\n{links}. 
+            For each link determine whether it is True or False if the link looks like it would lead to a news article.
+            Respond in this format: {{<number>:<True or False>, <number>:<True or False>, ..., <number>:<True or False>}}"""
+            # compile_url_prompt = f"""Here is a numbered list of urls found on a news webpage:\n{links}. 
+            # For each link determine whether it is True or False if the link looks like it would lead to a news article, give a reason why.
+            # Respond in this format: {{<number>:[<True or False>, <Reason>], <number>:[<True or False>, <Reason>], ..., <number>:[<True or False>, <Reason>]}}"""
+
+            resp = prompt_ivy(compile_url_prompt, ivy_html_system)
+            resp_str = extract_response_string(resp).strip()
+            if len(resp_str) == 0:
+                    local_retry -= 1
+                    print("Length of response was 0")
+                    continue
+            log_ivy(file, resp)
+            print(f"""resp_str[0]: {resp_str[0]}, resp_str[-1]: {resp_str[-1]}""")
+            if resp_str[0] == "{" and resp_str[-1] == "}":
+                    #we have a proper array returned
+                # While it may be more efficient ot put it directly in list format with no braces having the 
+                # bracketed form makes it easier for the LLM to relate to a structure and gives us an easy thing
+                # to check for propoer formation
+                print("URL EXTRACTION from: ", url)
+                valid = True
+                break
+            else:
+                print("UGHHHHHHH!!!!!!!!!!! Not in dictionary format")
+            local_retry -= 1
+        if not valid:
+            #TODO: determine if something specific needs to be retruned in case of failure
+            return
+        
+        vetted_url = []
+        url_ledger = ast.literal_eval(resp_str)
+        for i in range(len(html_links)):
+            if url_ledger[i + 1]:
+                vetted_url.append(html_links[i])
+
+        for vu in vetted_url:
+            print("Investigating URL: ", vu)
+            site_crawl2(depth - 1, file, vu, usr, results, mode, retry)
+        
+    # check if there is an existing record
+    if mode == SUMMARIZE:
+        ivy_prompt = f"""HTML:{html_content} UserInput: Summarize the content of this webpage in 4 sentences. Mention the main topic, key words and any social groups of people it mentions."""
+    else:
+        ivy_prompt = f"""HTML:{html_content} UserInput:{usr}\nIf there is no relevant information to the UserInput reply only with the word None. """
+
+    resp = prompt_ivy(ivy_prompt, ivy_html_system)
+
+    print(f"""URL: {url}""")
+    log_ivy(file, resp)
+
+    record = {
+        "Timestamp": crawl_time,
+        "Depth": depth,
+        "URL": url,
+        "Summary": extract_response_string(resp)
+    }
+    results.append(record)
+    print("Results length: ", len(results))
+    
+
+
+
+
+# what acts of justice are being undertaken in this community?
+
+def html_chunk(html_text, chunk_size=180000):
+    start = 0
+    resp = []
+    if chunk_size >= len(html_text):
+      resp.append(html_text)
+      return resp
+    while start != len(html_text):
+        print("Start: ", start)
+        idx = html_text.find(">", start + chunk_size) + 1
+        resp.append(html_text[start:idx])
+        start = idx
+        if start == len(html_text) or start == 0:
+          break
+    return resp
+
 # This function will tell us if we shole re-scrape the website if the 
 def redo_crawl_check(record, current_time_str):
     if record == None:
@@ -538,8 +666,106 @@ def redo_crawl_check(record, current_time_str):
     diff = current_time - record_time
     return diff.days >= timestamp_stale_allowance
 
-def check_start_end(str, start_char, end_char):
-    pass
+# what the lacrosse doin?
+def extract_html_links(html_text, root_str):
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    urls = []
+    res = ""
+
+    # Common attributes that contain URLs
+    attrs = ["href"]
+    excluded_exts = (".js", ".css", ".svg", ".jpg", ".png")
+
+    # for tag in soup.find_all(True):  # all tags
+    #     for attr in attrs:
+    #         if tag.has_attr(attr):
+    #             # urls.add(tag[attr])
+    #             res = res + tag.text + "\n"
+    #             print(tag)
+
+    blocked_paths = [
+        "wp-content",
+        "wp-includes",
+        "assets",
+        "static",
+        "js",
+        "css"
+    ]
+
+    # for tag in soup.find_all(True):
+    #     for attr in attrs:
+    #         url = tag.get(attr)
+    #         if url and not url.lower().endswith(excluded_exts):
+    #             res = res + tag.get(attr) + "\n"
+    #             # print(tag)
+
+    # for tag in soup.find_all(True):
+    #     for attr in attrs:
+    #         url = tag.get(attr)
+    #         if url and not url.lower().endswith(excluded_exts):
+    #             res = res + tag.get(attr) + "\n"
+    #             # print(tag)
+
+    # if root_str[-1] == "/":
+    #     # shave off last character
+    #     root_str = root_str[:len(root_str)-1]
+    
+    for tag in soup.find_all('a'):
+        for attr in attrs:
+            url = tag.get(attr) 
+            parsed = urlparse(url)
+            path = parsed.path.lower()
+            # cont = False
+            if url and path:
+                for b in blocked_paths:
+                    # print(path)
+                    if b in path:
+                        cont = True
+                        break
+                if root_str[-1] == "/":
+                    # shave off last character
+                    root_str = root_str[:len(root_str)-1]
+                if "http" not in url:
+                    if url[0] != "/":
+                        url = url + "/" + url
+                    url = root_str + url
+                # if cont:
+                #     continue
+                if not path.endswith(excluded_exts):
+                    res = res + url
+                # print("Attr: ", attr, "URL: ", url, "Tag: ", tag)
+                res = res + "|"
+            # if len(path) <= 1:
+            #     continue
+            # if path[0] != "/":
+            #     path = "/" + path
+            # if "http" in path:
+            #     res = res + path + "\n"
+            # else:
+            #     print("PATH: ", path)
+                
+            #     res = res + root_str + path + "\n"
+    
+    res = res[:-2]
+    res = res.split("|")
+    print("Extract HTML Links REsponse: ", res)
+    return res
+
+def extract_html_content(html_text):
+    sections = []
+    res = ""
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    for tag in soup.find_all(["h1", "h2", "h3", "p"]):
+        sections.append({
+            "type": tag.name,
+            "text": tag.get_text(strip=True)
+        })
+        # print(tag.get_text(strip=True))
+        res = res + tag.get_text(strip=True) + "\n"
+
+    return res
 
 def get_root(root_name):
     # This is funciton works two fold, it checks if the crawl file exists and it returns the record for the root of the file (homepage of the site)
@@ -609,6 +835,15 @@ def get_summaries_list(root_name):
         # the record dosent exist, exit
         return sum
     return sum
+
+def get_urls_list(url_list):
+    url_list = list(set(url_list))
+    res = ""
+    idx = 1
+    for u in url_list:
+        res = res + f"""{idx}. {u}\n"""
+        idx += 1
+    return url_list, res
 
 def ref_data_storage():
     pass
@@ -721,3 +956,34 @@ if __name__ == '__main__':
 # the purpose is to invite teh neigbors to a meeting, they are adults and community members, I want a standard format which i can subsititute roles n placeholders
 #
 #
+
+
+        # while local_retry > 0:
+        #     # perhaps try webpage chunking as a solution......
+        #     compile_url_prompt = "return all the URLs that look like they relate to news articles in this format only: [<url>, <url>, ... <url>]. For example: [\"https://foo\", \"https://bar\"]"
+        #     combo_prompt = f"""URLs: {html_links} \nUserInput: {compile_url_prompt}"""
+        #     print("COMBO PROMPT: ", combo_prompt, "\n\n")
+        #     resp = prompt_ivy(combo_prompt, ivy_url_disection)
+        #     resp_str = extract_response_string(resp).strip()
+        #     if len(resp_str) == 0:
+        #         local_retry -= 1
+        #         print("Whomp!!")
+        #         continue
+        #     log_ivy(file, resp)
+        #     print(f"""resp_str[0]: {resp_str[0]}, resp_str[-1]: {resp_str[-1]}""")
+        #     if resp_str[0] == "[" and resp_str[-1] == "]":
+        #         #we have a proper array returned
+        #         # While it may be more efficient ot put it directly in list format with no braces having the 
+        #         # bracketed form makes it easier for the LLM to relate to a structure and gives us an easy thing
+        #         # to check for propoer formation
+        #         print("URL EXTRACTION from: ", url)
+        #         valid = True
+        #         break
+        #     else:
+        #         print("UGHHHHHHH!!!!!!!!!!!")
+        #     local_retry -= 1
+        # if not valid:
+        #     #TODO: determine if something specific needs to be retruned in case of failure
+        #     return
+
+        # url_list = resp_str[1:-1].split(",")
