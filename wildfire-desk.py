@@ -1,6 +1,7 @@
 from build.lib.llmproxy import LLMProxy
 import time
 import datetime
+import sys
 from os import walk
 from string import Template
 from pathlib import Path
@@ -29,7 +30,12 @@ sage_instructions_directory = "sage-resources/sage-instructions"
 upload_resources = False
 crawl_time = ""
 news_resources = "sage-resources/web-crawl-data"
-news_region_resources = "sage-resources/state-local-news-summaries"
+news_region_resources = "sage-resources/state-local-news-outlets"
+selected_state = "California"
+selected_community = "Bay Area"
+conduct_internet_search = True
+
+# I want to make a social group that tartet problemt black voters care about, what shoudl I put in my mission statement to be relevant?
 
 ### ----------------------------------------------------------------------------------------------------
 ### Sage Settings        -
@@ -316,6 +322,12 @@ def get_source(rag_context):
     return response["result"]
     
 def chat_with_sage(user_message):
+    web_results = []
+    if conduct_internet_search:
+        web_results = search_web(user_message, selected_state, selected_community)
+
+    # TODO: format the web results in a way we can pass them to Sage so that she has that context when generating her answer
+
     response, rag_context = prompt_sage(user_message)
     answer = response["result"]
 
@@ -335,7 +347,8 @@ def chat_with_sage(user_message):
         "answer": answer,
         "sources": sources,
         "used_rag": len(rag_context) > 0,
-        "rag_context": rag_context
+        "rag_context": rag_context,
+        "web_results": web_results
     }
 
 def add_summary(state, move_ahead=0):
@@ -388,9 +401,13 @@ def add_summary(state, move_ahead=0):
 
 def get_all_supported_states():
     states = []
-    for (_, _, filename) in walk(news_region_resources):
-        name = filename.replace("_", " ")
-        states.append(name)
+    # _, _, state_files = 
+    for (_, _, filenames) in walk(news_region_resources):
+        for file in filenames:
+            fname = file.replace("_", " ")
+            state_name = fname.split(".")[0]
+            states.append(state_name)
+        break
     return states
 
 # The General community will encompass all new sites that have the community listed as - or --
@@ -399,30 +416,24 @@ def get_all_supported_communities(state):
     state_file = f"""{news_region_resources}/{state}.jsonl"""
     with open(state_file, "r", encoding="utf-8") as infile:
         for line in infile:
-            com = line["Community"]
+            record = json.loads(line)
+            com = record["Community"]
             if com.count("-") != len(com):
-                communitites.add()
+                communitites.add(com)
             else:
                 communitites.add("General")
 
     return list(communitites)
 
      
-def search_web(file, usr, state, community):
-    #1. determine if this request needs a websearch to local news
-    # TODO: try the question: Does the info from the user need information from local news services to be satisfied
-    # TODO: try, is the information the user gave in relation to current events / imply a relation to current events?
-    #              If yes then search local news services
-    # discern_query = f"""This is a query sent in by a user: {usr}\nwould answering the above query benefit from information from local news coverage?"""
-    # discern_query = f"""This is info sent in by a user: {usr}\nis the information above in relation to current events?"""
-    
+def search_web(usr, state, community):    
     discern_query = f"""The user said this: {usr}\nwould an response to the above benefit from information from local news coverage?"""
 
     discern_retry = 2
     while discern_retry != 0:
         resp = prompt_ivy(discern_query, ivy_discern_system)
         response_parts = extract_response_string(resp).split("|")
-        log_ivy(file, resp)
+        log_ivy(resp)
         if len(response_parts) != 2:
             # Something has gone wrong with formatting, dont conduct internet search
             discern_retry -= 1
@@ -432,48 +443,19 @@ def search_web(file, usr, state, community):
             break
         elif response_parts[0] == "No":
             print("No internet search was deemed necessary")
-            return 
+            return []
         else:
             discern_retry -= 1
             continue
     if discern_retry == 0:
         print("Discernment failed")
-        return
+        return []
     
     state_file = f"""{news_region_resources}/{state}.jsonl"""
-    state_summaries, outlet_records = get_summaries_list(state_file, community, 1)
-    eval_summaries_prompt = f"""Here is a numbered list of a summary of resources:\n{state_summaries}
-    For each summary determine whether it is True or False that articles from a website with this description would be beneficial to providing a response to this user input: {usr}.
-    Respond in this format: {{<number>:<True or False>, <number>:<True or False>, ..., <number>:<True or False>}}"""
-
-    print("These are the gathered outlet recods:\n", outlet_records)
-
-    # retry = 2
-    # valid = False
-    # outlet_ledger = {}
-    # while retry > 0:
-    #     resp = prompt_ivy(eval_summaries_prompt, ivy_html_system)
-    #     log_ivy(None, resp)
-    #     resp_str = extract_response_string(resp)
-    #     try:
-    #         outlet_ledger = ast.literal_eval(resp_str)
-    #     except:
-    #         retry -= 1
-    #         continue
-    #     valid = True
-    #     break
-
-    # if not valid:
-    #     # TODO: here is where we shoudl return something specific
-    #     print("Could not choose relevant news sites")
-    #     return
+    outlet_records = get_all_crawl_data(state_file, community)
 
     all_outlet_res = []
     for i in range(len(outlet_records)):
-    # for i in range(len(outlet_ledger)):
-    #     if outlet_ledger[i+1] != "True":
-    #         print("Outlet ", i+1, " rejected!")
-    #         continue
         outlet_rec = outlet_records[i]
         root_name = outlet_rec["Outlet"]
         root = get_root(root_name)
@@ -484,30 +466,25 @@ def search_web(file, usr, state, community):
         print("Outlet has been selected as relevant: ", root_name)
         if redo_crawl_check(root, crawl_time):
             print("We are gonna crawl: ", root_name)
-            # records = []
-            site_crawl2(crawl_depth, file, outlet_rec["Website"], usr, news_records, SUMMARIZE)
+            site_crawl(crawl_depth, outlet_rec["Website"], usr, news_records, SUMMARIZE)
             
             print("Final records length: ", len(news_records))
             print(f""" Records: {news_records}""")
-            # records = sorted(records, key=itemgetter("Depth"), reverse="True")
-
-            # save the records in the crawl file
             # Note below completely cleans the file any time its opened like this, if we want to keep
             # record we will need to implement extra logic
             crawl_file = open(f"""{news_resources}/{root_name}.jsonl""", "w")
             for r in news_records:
                 crawl_file.write(json.dumps(r) + "\n")
             crawl_file.close()
-
-            # make the summaries list and prompt around that
         else:
             print("This site already has crawled relevant data stored: ", root_name)
-            news_records = get_all_crawl_data(root_name)
+            state_file = f"""{news_resources}/{root_name}.jsonl"""
+            news_records = get_all_crawl_data(state_file)
         filename = f"""{news_resources}/{root_name}.jsonl"""
-        sum, _ = get_summaries_list(filename)
+        sum = get_summaries_list(filename)
         if sum == "":
             print("Something went wrong with making the summary")
-            return
+            return all_outlet_res
         eval_summaries_prompt = f"""Here is a numbered list of a summary of resources:\n{sum}
         For each summary determine whether it is True or False that a webpage with that content would be beneficial to providing a response to this user input: {usr}.
         Respond in this format: {{<number>:<True or False>, <number>:<True or False>, ..., <number>:<True or False>}}"""
@@ -519,7 +496,7 @@ def search_web(file, usr, state, community):
         record_ledger = {}
         while retry > 0:
             resp = prompt_ivy(eval_summaries_prompt, ivy_html_system)
-            log_ivy(None, resp)
+            log_ivy(resp)
             resp_str = extract_response_string(resp)
             try:
                 record_ledger = ast.literal_eval(resp_str)
@@ -530,9 +507,8 @@ def search_web(file, usr, state, community):
             break
         
         if not valid:
-            # TODO: here is where we shoudl return something specific
             print("There was a problem getting the ledger")
-            return
+            return all_outlet_res
 
         # THis will aggregate the information based on what the usr asked and the content
         web_info = []
@@ -541,14 +517,15 @@ def search_web(file, usr, state, community):
                 if record_ledger[i + 1]:
                     print("Exploring record: ", i+1)
                     target = news_records[i]
-                    site_crawl2(0, file, target["URL"], usr, web_info, SEARCH)
-                    web_record = {
-                        "Timestamp": web_info[-1]["Timestamp"],
-                        "Outlet": root_name, # TODO: replace this with the non-underscored version
-                        "URL": target["URL"],
-                        "Info": web_info[-1]["Summary"]
-                    }
-                    all_outlet_res.append(web_record)
+                    site_crawl(0, target["URL"], usr, web_info, SEARCH)
+                    if web_info[-1]["Summary"] != "None":
+                        web_record = {
+                            "Timestamp": web_info[-1]["Timestamp"],
+                            "Outlet": root_name, # TODO: replace this with the non-underscored version
+                            "URL": target["URL"],
+                            "Info": web_info[-1]["Summary"]
+                        }
+                        all_outlet_res.append(web_record)
             except:
                 # the enumeration would fall here because the website had no information of note and thus never got an entry
                 continue
@@ -557,38 +534,28 @@ def search_web(file, usr, state, community):
     print("USER RELATED RESPONSE")
     for i in range(len(all_outlet_res)):
         print(f"""************ Response {i} ************""")
-        # print(f"""{web_info[i]["Summary"]} """)
         print(all_outlet_res[i])
         print("************************\n")
 
-    
     return all_outlet_res
-        # records = []
-        # site_crawl(1, file, url, usr, records)
 
 # There are two modes, summarize and search:
-#               * summarize gets the summary of the webpage
-#               * search pulls information related to the usr statement
-def site_crawl2(depth, file, url, usr, results, mode, retry=2):
+#               * SUMMARIZE gets the summary of the webpage
+#               * SEARCH pulls information related to the usr statement
+def site_crawl(depth, url, usr, results, mode, retry=2):
     page = requests.get(url)
     html_content = extract_html_content(page.text)
     html_links = extract_html_links(page.text, url)
     html_links, links = get_urls_list(html_links)
-    # print(html_links)
     print("html text len: ", len(html_content))
 
     if depth != 0:
-        # html_chunks = html_chunk(page.text)
         valid = False
         local_retry = retry 
         while local_retry > 0:
-            # compile_url_prompt = f"""return all the URLs that relate to news articles from {url} in this format only: [<url>, <url>, ... <url>]. For example: [\"https://foo\", \"https://bar\"]. If there are no urls present respond with: []"""
             compile_url_prompt = f"""Here is a numbered list of urls found on a news webpage:\n{links}. 
             For each link determine whether it is True or False if the link looks like it would lead to a news article.
             Respond in this format only: {{<number>:<True or False>, <number>:<True or False>, ..., <number>:<True or False>}}"""
-            # compile_url_prompt = f"""Here is a numbered list of urls found on a news webpage:\n{links}. 
-            # For each link determine whether it is True or False if the link looks like it would lead to a news article, give a reason why.
-            # Respond in this format: {{<number>:[<True or False>, <Reason>], <number>:[<True or False>, <Reason>], ..., <number>:[<True or False>, <Reason>]}}"""
 
             resp = prompt_ivy(compile_url_prompt, ivy_html_system)
             resp_str = extract_response_string(resp).strip()
@@ -596,13 +563,10 @@ def site_crawl2(depth, file, url, usr, results, mode, retry=2):
                     local_retry -= 1
                     print("Length of response was 0")
                     continue
-            log_ivy(file, resp)
+            log_ivy(resp)
             print(f"""resp_str[0]: {resp_str[0]}, resp_str[-1]: {resp_str[-1]}""")
             if resp_str[0] == "{" and resp_str[-1] == "}":
-                    #we have a proper array returned
-                # While it may be more efficient ot put it directly in list format with no braces having the 
-                # bracketed form makes it easier for the LLM to relate to a structure and gives us an easy thing
-                # to check for propoer formation
+                # we have successfully got a dictionary format from Ivy
                 print("URL EXTRACTION from: ", url)
                 valid = True
                 break
@@ -621,7 +585,7 @@ def site_crawl2(depth, file, url, usr, results, mode, retry=2):
 
         for vu in vetted_url:
             print("Investigating URL: ", vu)
-            site_crawl2(depth - 1, file, vu, usr, results, mode, retry)
+            site_crawl(depth - 1, vu, usr, results, mode, retry)
         
     # check if there is an existing record
     if mode == SUMMARIZE:
@@ -632,7 +596,7 @@ def site_crawl2(depth, file, url, usr, results, mode, retry=2):
     resp = prompt_ivy(ivy_prompt, ivy_html_system)
 
     print(f"""URL: {url}""")
-    log_ivy(file, resp)
+    log_ivy(resp)
 
     record = {
         "Timestamp": crawl_time,
@@ -642,12 +606,6 @@ def site_crawl2(depth, file, url, usr, results, mode, retry=2):
     }
     results.append(record)
     print("Results length: ", len(results))
-    
-
-
-
-
-# what acts of justice are being undertaken in this community?
 
 def html_chunk(html_text, chunk_size=180000):
     start = 0
@@ -673,60 +631,23 @@ def redo_crawl_check(record, current_time_str):
     diff = current_time - record_time
     return diff.days >= timestamp_stale_allowance
 
-# what the lacrosse doin?
 def extract_html_links(html_text, root_str):
     soup = BeautifulSoup(html_text, "html.parser")
-
-    urls = []
-    res = ""
-
+    
     # Common attributes that contain URLs
+    res = ""
     attrs = ["href"]
     excluded_exts = (".js", ".css", ".svg", ".jpg", ".png")
 
-    # for tag in soup.find_all(True):  # all tags
-    #     for attr in attrs:
-    #         if tag.has_attr(attr):
-    #             # urls.add(tag[attr])
-    #             res = res + tag.text + "\n"
-    #             print(tag)
-
-    blocked_paths = [
-        "wp-content",
-        "wp-includes",
-        "assets",
-        "static",
-        "js",
-        "css"
-    ]
-
-    # for tag in soup.find_all(True):
-    #     for attr in attrs:
-    #         url = tag.get(attr)
-    #         if url and not url.lower().endswith(excluded_exts):
-    #             res = res + tag.get(attr) + "\n"
-    #             # print(tag)
-
-    # for tag in soup.find_all(True):
-    #     for attr in attrs:
-    #         url = tag.get(attr)
-    #         if url and not url.lower().endswith(excluded_exts):
-    #             res = res + tag.get(attr) + "\n"
-    #             # print(tag)
-
-    # if root_str[-1] == "/":
-    #     # shave off last character
-    #     root_str = root_str[:len(root_str)-1]
+    blocked_paths = ["wp-content", "wp-includes", "assets", "static", "js", "css"]
     
     for tag in soup.find_all('a'):
         for attr in attrs:
             url = tag.get(attr) 
             parsed = urlparse(url)
             path = parsed.path.lower()
-            # cont = False
             if url and path:
                 for b in blocked_paths:
-                    # print(path)
                     if b in path:
                         cont = True
                         break
@@ -737,26 +658,12 @@ def extract_html_links(html_text, root_str):
                     if url[0] != "/":
                         url = url + "/" + url
                     url = root_str + url
-                # if cont:
-                #     continue
                 if not path.endswith(excluded_exts):
                     res = res + url
-                # print("Attr: ", attr, "URL: ", url, "Tag: ", tag)
                 res = res + "|"
-            # if len(path) <= 1:
-            #     continue
-            # if path[0] != "/":
-            #     path = "/" + path
-            # if "http" in path:
-            #     res = res + path + "\n"
-            # else:
-            #     print("PATH: ", path)
-                
-            #     res = res + root_str + path + "\n"
     
     res = res[:-2]
     res = res.split("|")
-    # print("Extract HTML Links REsponse: ", res)
     return res
 
 def extract_html_content(html_text):
@@ -769,7 +676,6 @@ def extract_html_content(html_text):
             "type": tag.name,
             "text": tag.get_text(strip=True)
         })
-        # print(tag.get_text(strip=True))
         res = res + tag.get_text(strip=True) + "\n"
 
     return res
@@ -809,25 +715,35 @@ def get_crawl_record(url, root_name):
         return None
     return None
 
-def get_all_crawl_data(root_name):
+def get_all_crawl_data(filename, community=None):
     res = []
-    try:
-        crawl_file = open(f"""{news_resources}/{root_name}.jsonl""")
+    try :
+        crawl_file = open(filename)
         line = crawl_file.readline()
 
         while line:
             record = json.loads(line)
+            if community != None:
+                if record["Community"].count("-") == len(record["Community"]):
+                        print("General Conversion")
+                        record["Community"] = "General"
+                if record["Community"] != community:
+                        print("Failed community check: ", record)
+                        line = crawl_file.readline()
+                        continue
             res.append(record)
             line = crawl_file.readline()
         crawl_file.close()
     except:
+        print("get all crawl data bad exit")
         return res
     return res
 
+#I am trying to make a social group that pertains to black voters, what things shoudl I include in the mission of my group?
 # There are going to be two modes:
 #       0. Makes the summaries of all records and returns all records
 #       1. Makes summaries and logs records that are from a particular community
-def get_summaries_list(filename, community="", mode=0):
+def get_summaries_list(filename):
     sum = ""
     idx = 1
     records = []
@@ -838,11 +754,6 @@ def get_summaries_list(filename, community="", mode=0):
         # when line is none then that is the end of the file
         while line:
             record = json.loads(line)
-            if mode == 1:
-                if record["Community"] != community:
-                    print("Failed community check: ", record)
-                    line = crawl_file.readline()
-                    continue
             sum = sum + f"""{idx}. {record["Summary"]}\n"""
             records.append(record)
             line = crawl_file.readline()
@@ -852,9 +763,7 @@ def get_summaries_list(filename, community="", mode=0):
     except:
         # the record dosent exist, exit
         return sum
-    return sum, records
-
-#what is california's mayor doing in the community?
+    return sum
 
 def get_urls_list(url_list):
     url_list = list(set(url_list))
@@ -864,14 +773,6 @@ def get_urls_list(url_list):
         res = res + f"""{idx}. {u}\n"""
         idx += 1
     return url_list, res
-
-def ref_data_storage():
-    pass
-
-def store_crawl():
-    pass
-
-#what is happening to this community's students    
 
 def prompt_ivy(query_prompt, ivy_sys):
 
@@ -909,7 +810,7 @@ def log_sage(file, response, rag_context, verbose=verbose, display_rag=display_r
     elif(display_rag == 2):
         print(f"""\n******************\nRag_context_length: {len(rag_context)} \n******************\n\n""")
 
-def log_ivy(file, response, verbose=verbose):
+def log_ivy(response, verbose=verbose):
     phrase = f"""Ivy: {extract_response_string(response)}\n"""    
     # file.write(phrase)
 
@@ -931,15 +832,14 @@ def extract_response_string(response):
 ### ----------------------------------------------------------------------------------------------------
 
 def run_cli():
-    # add_summary("Washington")
-    # if not setup_sage():
-    #     print("An error occurred when setting up this application.")
-    #     sys.exit(1)
+    if not setup_sage():
+        print("An error occurred when setting up this application.")
+        sys.exit(1)
 
     with open(f"log-{timestamp}.txt", "w", encoding="utf-8") as file:
         # Intro
-        # intro = get_intro()
-        # log_sage(file, intro, "")
+        intro = get_intro()
+        log_sage(file, intro, "")
 
         print(str(timestamp))
         usr = input("Type your response here: ")
@@ -948,21 +848,18 @@ def run_cli():
             # Log user input
             log_user(file, usr)
 
-            web_results = search_web(file, usr, "California", "Bay Area")
-            # print("Final web search results!!!:\n", web_results)
-
             # Core chat call
-            # result = chat_with_sage(usr)
+            result = chat_with_sage(usr)
 
             # # Log and print answer
-            # log_sage(file, result["answer"], result["rag_context"])
+            log_sage(file, result["answer"], result["rag_context"])
 
             # # Show sources if they exist
-            # if result["sources"]:
-            #     print("\nCitation Summary:\n")
-            #     log_sage(file, result["sources"], "")
-            # else:
-            #     print("WARNING: No vetted resources were used to produce the information above")
+            if result["sources"]:
+                print("\nCitation Summary:\n")
+                log_sage(file, result["sources"], "")
+            else:
+                print("WARNING: No vetted resources were used to produce the information above")
 
             # Next input
             usr = input("Type your response here: ")
@@ -970,77 +867,3 @@ def run_cli():
 
 if __name__ == '__main__':
     run_cli()
-
-# sample statements
-#
-# how would i organize a local group involving wildfires? 
-# I want to organize a neighborhood group focused on wildfire recovery actions, I have not contacted any local authorities.
-# the purpose is to invite teh neigbors to a meeting, they are adults and community members, I want a standard format which i can subsititute roles n placeholders
-#
-#
-
-
-        # while local_retry > 0:
-        #     # perhaps try webpage chunking as a solution......
-        #     compile_url_prompt = "return all the URLs that look like they relate to news articles in this format only: [<url>, <url>, ... <url>]. For example: [\"https://foo\", \"https://bar\"]"
-        #     combo_prompt = f"""URLs: {html_links} \nUserInput: {compile_url_prompt}"""
-        #     print("COMBO PROMPT: ", combo_prompt, "\n\n")
-        #     resp = prompt_ivy(combo_prompt, ivy_url_disection)
-        #     resp_str = extract_response_string(resp).strip()
-        #     if len(resp_str) == 0:
-        #         local_retry -= 1
-        #         print("Whomp!!")
-        #         continue
-        #     log_ivy(file, resp)
-        #     print(f"""resp_str[0]: {resp_str[0]}, resp_str[-1]: {resp_str[-1]}""")
-        #     if resp_str[0] == "[" and resp_str[-1] == "]":
-        #         #we have a proper array returned
-        #         # While it may be more efficient ot put it directly in list format with no braces having the 
-        #         # bracketed form makes it easier for the LLM to relate to a structure and gives us an easy thing
-        #         # to check for propoer formation
-        #         print("URL EXTRACTION from: ", url)
-        #         valid = True
-        #         break
-        #     else:
-        #         print("UGHHHHHHH!!!!!!!!!!!")
-        #     local_retry -= 1
-        # if not valid:
-        #     #TODO: determine if something specific needs to be retruned in case of failure
-        #     return
-
-        # url_list = resp_str[1:-1].split(",")
-
-
-
-
-
-    #1.5, ask Sage what area is important to look for info in?
-    # Idea: if sage does not know the relevant area, pause this process and have Sage ask the user follow up questions
-    #           then report this info to 
-
-    # 1. Fetch relevant webpages
-    # url = "https://outlooknewspapers.com/pasadenaoutlook/"
-    # print(html_text)
-
-    # print(f"""{url}: {len(requests.get(url).text)} """)
-
-    # url = "https://thesunreporter.com/"
-
-    # print(f"""{url}: {len(requests.get(url).text)} """)
-
-    # url = "https://www.berkeleyside.org/"
-
-    # print(f"""{url}: {len(requests.get(url).text)} """)
-
-
-    # compile_url_prompt = "return all the URLs that relate to news articles in this format: [<url>, <url>, ... <url>]"
-    # Idea: attach a timestamp to the stored html pages and if its older than X hours, re-fetch
-
-    # # Systematically go through each webpage
-    # combo_prompt = f"""HTML:{html_text} UserInput:{usr} """
-    # resp = prompt_ivy(combo_prompt, ivy_html_system)
-    # log_ivy(file, resp)
-
-    # {"Timestamp": "", "Depth": 0, "URL": "", "Summary": ""}
-    # root_name = "San_Francisco_Sun_Reporter"
-    # root_name = "Berkeleyside"
